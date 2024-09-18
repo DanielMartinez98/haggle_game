@@ -4,6 +4,7 @@ import random
 import openai
 import os
 import re
+import requests  # For downloading images
 from textblob import TextBlob
 from openai import OpenAIError
 
@@ -16,9 +17,6 @@ font = pygame.font.SysFont(None, 32)
 # Import OpenAI API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")  # Ensure to set this in your environment
 
-# Item details
-item_name = "Antique Vase"
-
 # Game state variables
 attempt = 0
 max_attempts = 3
@@ -27,9 +25,63 @@ player_prices = {1: None, 2: None}
 input_text = ''
 owner_response = ''
 conversation_history = []
-original_price = random.randint(100, 500)
-store_price = original_price
 awaiting_continue = False  # New flag to wait for extra input
+
+def generate_item():
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that provides interesting and unique store items to sell. "
+                        "Output the item name and description in the following format:\n"
+                        "Item Name: [name]\nDescription: [description]"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": "Generate a unique item for sale in a store, including a short name and a brief description."
+                }
+            ],
+            max_tokens=100,
+            temperature=0.7
+        )
+        item_info = response.choices[0].message['content']
+        # Parse the item_info to extract name and description
+        name_match = re.search(r"Item Name:\s*(.*)", item_info)
+        desc_match = re.search(r"Description:\s*(.*)", item_info)
+        if name_match and desc_match:
+            item_name = name_match.group(1).strip()
+            item_description = desc_match.group(1).strip()
+        else:
+            # If parsing fails, use default values
+            item_name = "Mystery Item"
+            item_description = "An intriguing item with unknown properties."
+        return item_name, item_description
+    except OpenAIError as e:
+        print(f"An error occurred while generating item: {e}")
+        return "Mystery Item", "An intriguing item with unknown properties."
+
+def generate_item_image(item_name):
+    # Use OpenAI Image API to generate an image of the item
+    try:
+        response = openai.Image.create(
+            prompt=f"A detailed, high-quality image of a {item_name}",
+            n=1,
+            size="256x256"
+        )
+        image_url = response['data'][0]['url']
+        # Download the image and save it locally
+        image_data = requests.get(image_url).content
+        image_filename = 'item_image.png'
+        with open(image_filename, 'wb') as handler:
+            handler.write(image_data)
+        return image_filename
+    except OpenAIError as e:
+        print(f"An error occurred while generating item image: {e}")
+        return None
 
 def get_store_owner_response(conversation_history, current_price):
     # Build the messages list
@@ -116,6 +168,7 @@ def reset_game():
     global attempt, max_attempts, player_turn, player_prices
     global input_text, owner_response, conversation_history
     global store_price, original_price, awaiting_continue
+    global item_name, item_description, item_image, scaled_item_image  # Add item variables
     attempt = 0
     max_attempts = 3
     player_turn = 1
@@ -123,9 +176,21 @@ def reset_game():
     input_text = ''
     owner_response = ''
     conversation_history = []
+    awaiting_continue = False
+
+    # Generate new item and price
+    item_name, item_description = generate_item()
     original_price = random.randint(100, 500)
     store_price = original_price
-    awaiting_continue = False
+
+    # Generate item image
+    item_image_path = generate_item_image(item_name)
+    if item_image_path:
+        item_image = pygame.image.load(item_image_path)
+        # Scale down the image to a smaller size (e.g., 128x128)
+        scaled_item_image = pygame.transform.scale(item_image, (128, 128))
+    else:
+        scaled_item_image = None  # Or use a default image
 
 def game_over_screen():
     # Determine winner
@@ -211,11 +276,17 @@ while game_running:
                             # Append player's input to conversation history
                             conversation_history.append(("Player", input_text))
 
+                            # Print player's input to console
+                            print(f"Player {player_turn}: {input_text}")
+
                             # Send conversation history to ChatGPT
                             owner_response = get_store_owner_response(conversation_history, store_price)
 
                             # Append owner's response to conversation history
                             conversation_history.append(("Owner", owner_response))
+
+                            # Print owner's response to console
+                            print(f"Owner: {owner_response}")
 
                             # Adjust price based on owner's response
                             new_price = adjust_price(input_text, owner_response, store_price)
@@ -243,11 +314,21 @@ while game_running:
         screen.blit(item_text, (50, 20))
         screen.blit(price_text, (50, 60))
 
+        # Display item image if available
+        if scaled_item_image:
+            screen.blit(scaled_item_image, (50, 100))
+
         # Display conversation history with text wrapping
         y_offset = 100
+        if scaled_item_image:
+            image_height = scaled_item_image.get_height()
+            y_offset += image_height + 20  # Adjust y_offset if image is displayed
+        else:
+            y_offset += 20  # Add some spacing if no image
+
         max_width = 700  # Adjust according to screen size and margins
         line_height = font.get_linesize()
-        max_lines = (400 - y_offset) // line_height  # Adjust the vertical space available
+        max_lines = (500 - y_offset - 50) // line_height  # Adjust the vertical space available
         displayed_lines = []
         for speaker, text in conversation_history[-10:]:  # Limit number of messages
             wrapped_lines = wrap_text(f"{speaker}: {text}", font, max_width)
@@ -269,16 +350,25 @@ while game_running:
             # Display input box
             input_box = pygame.Rect(50, 500, 700, 32)
             pygame.draw.rect(screen, (200, 200, 200), input_box)
+
+            # Render the input text
             text_surface = font.render(input_text, True, (0, 0, 0))
-            screen.blit(text_surface, (input_box.x + 5, input_box.y + 5))
+            # If the text is wider than the input box, adjust the x-coordinate
+            if text_surface.get_width() > input_box.width - 10:
+                offset = text_surface.get_width() - (input_box.width - 10)
+            else:
+                offset = 0
+            screen.blit(text_surface, (input_box.x + 5 - offset, input_box.y + 5))
 
             # Display attempts
             attempts_text = font.render(f"Attempt: {attempt + 1}/{max_attempts}", True, (0, 0, 0))
             screen.blit(attempts_text, (50, 550))
 
-        # Display player turn
+        # Display player turn, moved closer to center
         player_text = font.render(f"Player {player_turn}'s Turn", True, (0, 0, 0))
-        screen.blit(player_text, (650, 20))
+        text_rect = player_text.get_rect()
+        text_rect.topright = (750, 20)  # Adjusted position
+        screen.blit(player_text, text_rect)
 
         pygame.display.flip()
 
